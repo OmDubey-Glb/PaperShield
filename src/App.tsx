@@ -18,6 +18,7 @@ export default function App() {
   const [busy,setBusy] = useState(false);
   const [voiceOn,setVoiceOn] = useState(false);
   const [error,setError] = useState("");
+  const [qualityWarning,setQualityWarning] = useState<number | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const cameraRef = useRef<HTMLInputElement>(null);
   const recognitionRef = useRef<any>(null);
@@ -32,9 +33,50 @@ export default function App() {
     window.speechSynthesis.speak(utter);
   }
   function setSample() { setFileName(t.sampleTitle); setText(t.sampleText); setReport(true); setAnswer(""); }
-  async function onFile(file?:File) {
+
+  // Estimate blur locally with the variance of the Laplacian (a sharpness heuristic).
+  // This is an approximate quality score, not a certified measurement of blur.
+  async function estimateBlurPercent(file: File): Promise<number> {
+    const objectUrl = URL.createObjectURL(file);
+    try {
+      const image = new Image();
+      image.src = objectUrl;
+      await new Promise<void>((resolve, reject) => {
+        image.onload = () => resolve();
+        image.onerror = () => reject(new Error("Could not read this image."));
+      });
+      const canvas = document.createElement("canvas");
+      const scale = Math.min(1, 512 / Math.max(image.naturalWidth, image.naturalHeight));
+      canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+      canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+      const context = canvas.getContext("2d", { willReadFrequently: true });
+      if (!context) throw new Error("Image quality check is unavailable.");
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      const { data, width, height } = context.getImageData(0, 0, canvas.width, canvas.height);
+      const gray = new Float32Array(width * height);
+      for (let i = 0; i < gray.length; i++) {
+        const p = i * 4;
+        gray[i] = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2];
+      }
+      let sum = 0, sumSquares = 0, count = 0;
+      for (let y = 1; y < height - 1; y++) {
+        for (let x = 1; x < width - 1; x++) {
+          const i = y * width + x;
+          const laplacian = gray[i - width] + gray[i + width] + gray[i - 1] + gray[i + 1] - 4 * gray[i];
+          sum += laplacian;
+          sumSquares += laplacian * laplacian;
+          count++;
+        }
+      }
+      const variance = count ? Math.max(0, sumSquares / count - (sum / count) ** 2) : 0;
+      return Math.round(Math.max(0, Math.min(100, (1 - variance / 180) * 100)));
+    } finally {
+      URL.revokeObjectURL(objectUrl);
+    }
+  }
+\n  async function onFile(file?:File) {
     if (!file) return;
-    setError(""); setFileName(file.name); setReport(false); setAnswer("");
+    setError(""); setQualityWarning(null); setFileName(file.name); setReport(false); setAnswer("");
     if (file.type === "text/plain") setText(await file.text());
     else if (file.type === "application/pdf") {
       setText("PDF selected: " + file.name + ". Connect a PDF text-extraction/OCR service to analyze its contents. For now, use the sample notice to preview the interface.");
@@ -80,7 +122,7 @@ export default function App() {
     if (!SR) { setError("Speech recognition is not supported in this browser."); return; }
     setVoiceOn(true); startListening();
   }
-  function clear() { recognitionRef.current?.stop(); window.speechSynthesis?.cancel(); setVoiceOn(false); setListening(false); setFileName(""); setText(""); setReport(false); setAnswer(""); setQuestion(""); setError(""); }
+  function clear() { setQualityWarning(null); recognitionRef.current?.stop(); window.speechSynthesis?.cancel(); setVoiceOn(false); setListening(false); setFileName(""); setText(""); setReport(false); setAnswer(""); setQuestion(""); setError(""); }
   return <main className="shell">
     <header className="topbar"><div className="brand"><span className="brand-mark"><ShieldCheck/></span><span>Paper<span>Shield</span></span></div><div className="top-actions"><span className="privacy"><i/>Private mode</span><div className="language"><Globe size={17}/>{(["en","hi","mr"] as Lang[]).map(l=><button className={lang===l?"active":""} onClick={()=>{setLang(l);setAnswer("");}} key={l}>{l.toUpperCase()}</button>)}</div></div></header>
     <section className="hero"><div><div className="kicker">{t.kicker}</div><h1>{t.title}</h1><p>{t.sub}</p><div className="trust"><span><Mic/>Voice-first</span><span>文 3 languages</span><span><ShieldCheck/>Privacy-minded</span></div></div><div className="orb-wrap"><div className="orbit orbit-a"/><div className="orbit orbit-b"/><div className="orb"><Sparkles/></div><span className="orb-note">Your documents<br/>understood<br/>in your language</span></div></section>
@@ -89,7 +131,7 @@ export default function App() {
       <input ref={cameraRef} hidden type="file" accept="image/*" capture="environment" onChange={e=>onFile(e.target.files?.[0])}/><input ref={inputRef} hidden type="file" accept="application/pdf,image/*,.txt" onChange={e=>onFile(e.target.files?.[0])}/>
       <div className="hint-row"><span><ShieldCheck size={17}/>{t.allow}</span><button onClick={()=>setSample()}>{t.sample}<ArrowRight size={15}/></button></div>
       {fileName && <div className="selected"><FileText size={18}/><span>{fileName}</span><button onClick={clear} aria-label="Clear"><Trash2 size={17}/></button></div>}
-      {error && <p className="notice">{error}</p>}
+      {qualityWarning !== null && <p className="quality-warning" role="alert">⚠️ This photo may be blurry (estimated blur level: {qualityWarning}%). Please retake it in good light, hold your phone steady, and make sure the text is in focus.</p>}\n      {error && <p className="notice">{error}</p>}
       <div className="bottom-row"><span>{t.private}</span><button onClick={clear}>{t.clear}</button></div>
     </section>
     {fileName && <section className="report glass"><div className="step">02 / DOCUMENT EXPLANATION</div><h2>{t.report}</h2><button className="primary analyze" disabled={busy} onClick={analyze}>{busy?"Analyzing…":t.analyze}</button>{busy && <div className="loader"><div/></div>}{report && <><p className="summary">{answer || t.summary}</p><ol>{t.points.map((p,i)=><li key={i}>{p}</li>)}</ol><button className="listen" onClick={()=>speak(answer || t.summary)}><Volume2 size={18}/> {lang==="hi"?"सुनें":lang==="mr"?"ऐका":"Listen to explanation"}</button></>}</section>}
